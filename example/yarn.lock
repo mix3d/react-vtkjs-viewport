@@ -8789,7 +8789,11 @@ react-router@5.0.0:
     tiny-warning "^1.0.0"
 
 "react-vtkjs-viewport@file:..":
+<<<<<<< HEAD
   version "0.0.8"
+=======
+  version "0.0.9"
+>>>>>>> fix SVG display
   dependencies:
     moment "^2.24.0"
 
