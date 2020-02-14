@@ -13,6 +13,7 @@ import { ViewTypes } from 'vtk.js/Sources/Widgets/Core/WidgetManager/Constants';
 import { createSub } from '../lib/createSub.js';
 import realsApproximatelyEqual from '../lib/math/realsApproximatelyEqual';
 import createLabelPipeline from './createLabelPipeline';
+import { uuidv4 } from './../helpers';
 
 const minSlabThickness = 0.1; // TODO -> Should this be configurable or not?
 
@@ -59,6 +60,8 @@ export default class View2D extends Component {
     this.state = {
       voi: this.getVOI(props.volumes[0]),
     };
+
+    this.apiProperties = {};
   }
 
   updatePaintbrush() {
@@ -72,6 +75,9 @@ export default class View2D extends Component {
   }
 
   componentDidMount() {
+    // Tracking ID to tie emitted events to this component
+    const uid = uuidv4();
+
     this.genericRenderWindow = vtkGenericRenderWindow.newInstance({
       background: [0, 0, 0],
     });
@@ -156,29 +162,6 @@ export default class View2D extends Component {
     filters = [this.paintFilter];
     widgets = [this.paintWidget];
 
-    /*
-    TODO: Enable normal orthogonal slicing / window level as default instead of
-    rotation tool
-
-    const istyle = CustomSliceInteractorStyle.newInstance();
-    this.istyle = istyle
-    this.renderWindow.getInteractor().setInteractorStyle(istyle)
-    istyle.setCurrentVolumeNumber(0); // background volume
-    istyle.setSlicingMode(1, true); // force set slice mode
-
-    interactor.setInteractorStyle(istyle);
-    */
-
-    /*
-    TODO: Use for maintaining clipping range for MIP
-
-    const interactor = this.renderWindow.getInteractor();
-    //const clippingRange = renderer.getActiveCamera().getClippingRange();
-
-    interactor.onAnimation(() => {
-      renderer.getActiveCamera().setClippingRange(...r);
-    });*/
-
     // Set orientation based on props
     if (this.props.orientation) {
       const { orientation } = this.props;
@@ -218,6 +201,12 @@ export default class View2D extends Component {
     const boundGetSlabThickness = this.getSlabThickness.bind(this);
     const boundSetSlabThickness = this.setSlabThickness.bind(this);
     const boundAddSVGWidget = this.addSVGWidget.bind(this);
+    const boundGetApiProperty = this.getApiProperty.bind(this);
+    const boundSetApiProperty = this.setApiProperty.bind(this);
+    const boundSetSegmentRGB = this.setSegmentRGB.bind(this);
+    const boundSetSegmentRGBA = this.setSegmentRGBA.bind(this);
+    const boundSetSegmentAlpha = this.setSegmentAlpha.bind(this);
+    const boundUpdateImage = this.updateImage.bind(this);
 
     this.svgWidgets = {};
 
@@ -228,6 +217,7 @@ export default class View2D extends Component {
        * we make with consumers of this component.
        */
       const api = {
+        uid, // Tracking id available on `api`
         genericRenderWindow: this.genericRenderWindow,
         widgetManager: this.widgetManager,
         svgWidgetManager: this.svgWidgetManager,
@@ -239,15 +229,30 @@ export default class View2D extends Component {
         actors,
         volumes,
         _component: this,
+        updateImage: boundUpdateImage,
         updateVOI: boundUpdateVOI,
         getOrientation: boundGetOrienation,
         setInteractorStyle: boundSetInteractorStyle,
         getSlabThickness: boundGetSlabThickness,
         setSlabThickness: boundSetSlabThickness,
+        setSegmentRGB: boundSetSegmentRGB,
+        setSegmentRGBA: boundSetSegmentRGBA,
+        setSegmentAlpha: boundSetSegmentAlpha,
+        get: boundGetApiProperty,
+        set: boundSetApiProperty,
+        type: 'VIEW2D',
       };
 
       this.props.onCreated(api);
     }
+  }
+
+  getApiProperty(propertyName) {
+    return this.apiProperties[propertyName];
+  }
+
+  setApiProperty(propertyName, value) {
+    this.apiProperties[propertyName] = value;
   }
 
   addSVGWidget(widget, name) {
@@ -296,6 +301,12 @@ export default class View2D extends Component {
     renderWindow.render();
   }
 
+  updateImage() {
+    const renderWindow = this.genericRenderWindow.getRenderWindow();
+
+    renderWindow.render();
+  }
+
   setInteractorStyle({ istyle, callbacks = {}, configuration = {} }) {
     const { volumes } = this.props;
     const renderWindow = this.genericRenderWindow.getRenderWindow();
@@ -312,15 +323,6 @@ export default class View2D extends Component {
     }
 
     const slabThickness = this.getSlabThickness();
-
-    /*
-    let currentSlabThickness;
-    if (currentIStyle.getSlabThickness && istyle.getSlabThickness) {
-      currentSlabThickness = currentIStyle.getSlabThickness();
-      this.currentSlabThickness = currentSlabThickness;
-    }
-    */
-
     const interactor = renderWindow.getInteractor();
 
     interactor.setInteractorStyle(istyle);
@@ -365,6 +367,30 @@ export default class View2D extends Component {
 
   getOrientation() {
     return this.props.orientation;
+  }
+
+  setSegmentRGBA(segmentIndex, [red, green, blue, alpha]) {
+    this.setSegmentRGB(segmentIndex, [red, green, blue]);
+    this.setSegmentAlpha(segmentIndex, alpha);
+  }
+
+  setSegmentRGB(segmentIndex, [red, green, blue]) {
+    const { labelmap } = this;
+
+    labelmap.cfun.addRGBPoint(segmentIndex, red / 255, green / 255, blue / 255);
+  }
+
+  setSegmentAlpha(segmentIndex, alpha) {
+    const { labelmap } = this;
+    let { globalOpacity } = this.props.labelmapRenderingOptions;
+
+    if (globalOpacity === undefined) {
+      globalOpacity = 1.0;
+    }
+
+    const segmentOpacity = (alpha / 255) * globalOpacity;
+
+    labelmap.ofun.addPointLong(segmentIndex, segmentOpacity, 0.5, 1.0);
   }
 
   componentDidUpdate(prevProps) {
@@ -413,7 +439,25 @@ export default class View2D extends Component {
     ) {
       this.subs.labelmap.unsubscribe();
 
+      // Remove actors.
+      if (this.labelmap && this.labelmap.actor) {
+        this.renderer.removeVolume(this.labelmap.actor);
+
+        if (this.api) {
+          const { actors } = this.api;
+
+          const index = actors.findIndex(
+            actor => actor === this.labelmap.actor
+          );
+
+          if (index !== -1) {
+            actors.splice(index, 1);
+          }
+        }
+      }
+
       const labelmapImageData = this.props.paintFilterLabelMapImageData;
+
       const labelmap = createLabelPipeline(
         this.props.paintFilterBackgroundImageData,
         labelmapImageData,
@@ -421,6 +465,15 @@ export default class View2D extends Component {
       );
 
       this.labelmap = labelmap;
+
+      // Add actors.
+      if (this.labelmap && this.labelmap.actor) {
+        this.renderer.addVolume(this.labelmap.actor);
+
+        if (this.api) {
+          this.api.actors = this.api.actors.concat(this.labelmap.actor);
+        }
+      }
 
       labelmap.mapper.setInputConnection(this.paintFilter.getOutputPort());
 
